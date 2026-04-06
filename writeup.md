@@ -56,3 +56,83 @@ lm_head: $2BTd_mV$
 As model size increases, the FFN takes up proportionally more FLOPs because its cost scales as $d_m^2$ (since $d_{ff} = 4d_m$), while MHA's cost also scales as $d_m^2$ but includes a smaller $T^2$ term that becomes relatively less significant. The lm_head shrinks proportionally because its FLOPs scale as $d_m \cdot V$ (linear in $d_m$) compared to the $d_m^2$ scaling of MHA and FFN.
 
 (e) Increasing context length from 1024 to 16384 (16x) increases total FLOPs by 33.1x (from 4.5T to 149.5T), since the MHA attention matmuls scale as $T^2$ while FFN and lm_head scale linearly with $T$. MHA becomes the dominant component, growing from 29.4% to 65.9% of total FLOPs, while FFN drops from 66.9% to 32.3%, as the quadratic $T^2$ attention cost overwhelms the linear FFN cost.
+
+### 4.2 The SGD Optimizer
+
+A small learning rate (1e1) causes slow but steady decay, a moderate learning rate (1e2) converges much faster and reaches near-zero, while a large learning rate (1e3) causes the loss to diverge exponentially.
+
+### 4.3 AdamW accounting
+
+(a) Let $B$ = batch_size, $T$ = context_length, $L$ = num_layers, $H$ = num_heads, $d_m$ = d_model, $V$ = vocab_size, $d_{ff} = 4d_m$.
+
+**Parameters**
+
+Per transformer block:
+- 2 RMSNorm weights: $2d_m$
+- MHA (Q, K, V, O projections): $4d_m^2$
+- FFN (W1, W2, W3): $3d_m d_{ff} = 12d_m^2$
+
+Total per block: $2d_m + 16d_m^2$
+
+Outside blocks (token embedding, final RMSNorm, lm_head): $2Vd_m + d_m$
+
+$$P = L(2d_m + 16d_m^2) + 2Vd_m + d_m$$
+
+$$\text{Memory}_{\text{params}} = 4P \text{ bytes}$$
+
+**Activations** (per transformer block)
+
+- RMSNorm (×2): $2 \cdot BTd_m$
+- MHA: Q, K, V, weighted-sum output, output projection: $5 \cdot BTd_m$; attention scores + softmax output: $2 \cdot BHT^2$
+- FFN: W1 output + SiLU + W2 output: $2 \cdot BT d_{ff} + BTd_m = 9 \cdot BTd_m$
+
+Per block total: $16BTd_m + 2BHT^2$
+
+Outside blocks: final RMSNorm ($BTd_m$), output embedding ($BTV$), cross-entropy ($BTV$)
+
+$$\text{Memory}_{\text{activations}} = 4\bigl(L(16BTd_m + 2BHT^2) + BTd_m + 2BTV\bigr) \text{ bytes}$$
+
+**Gradients**
+
+Same shape as parameters:
+
+$$\text{Memory}_{\text{gradients}} = 4P \text{ bytes}$$
+
+**Optimizer state** (AdamW stores first and second moment vectors $m$, $v$ per parameter):
+
+$$\text{Memory}_{\text{optimizer}} = 8P \text{ bytes}$$
+
+**Total**
+
+$$\text{Total} = 16P + 4\bigl(L(16BTd_m + 2BHT^2) + BTd_m + 2BTV\bigr) \text{ bytes}$$
+
+(b) For GPT-2 XL: $L=48$, $d_m=1600$, $H=25$, $T=1024$, $V=50257$, $d_{ff}=6400$.
+
+$$P = 48(2 \cdot 1600 + 16 \cdot 1600^2) + 2 \cdot 50257 \cdot 1600 + 1600 = 2{,}127{,}057{,}600$$
+
+$$16P = 34{,}032{,}921{,}600 \text{ bytes} \approx 31.69 \text{ GB (model + gradients + optimizer)}$$
+
+Activation memory per batch element:
+
+$$4\bigl(48(16 \cdot 1024 \cdot 1600 + 2 \cdot 25 \cdot 1024^2) + 1024 \cdot 1600 + 2 \cdot 1024 \cdot 50257\bigr) = 15{,}517{,}753{,}344 \approx 14.45 \text{ GB}$$
+
+Total memory as a function of batch size:
+
+$$\text{Total} = 14.45 \cdot B + 31.69 \text{ GB}$$
+
+For 80 GB: $B \leq \frac{80 - 31.69}{14.45} \approx 3.34$, so the maximum batch size is $B = 3$.
+
+(c) AdamW performs a fixed number of elementwise operations per parameter: updating $m$ (3 FLOPs), updating $v$ (4 FLOPs), computing $\sqrt{v}+\epsilon$ (2 FLOPs), the parameter update (3 FLOPs), and weight decay (2 FLOPs) — roughly 14 FLOPs per parameter. Thus one AdamW step takes $O(P) \approx 14P$ FLOPs total. This is negligible compared to the forward/backward pass, which scales as $O(Pd_m)$ due to matrix multiplications.
+
+(d) Following Kaplan et al. and Hoffmann et al., the total training FLOPs $\approx 6P \cdot D$, where $D$ is the total number of tokens processed and the factor of 6 accounts for the forward pass ($\approx 2P$ FLOPs/token) plus a backward pass twice as costly ($\approx 4P$ FLOPs/token).
+
+$$D = B \times T \times \text{steps} = 1024 \times 1024 \times 400{,}000 \approx 4.19 \times 10^{11} \text{ tokens}$$
+
+$$\text{Total FLOPs} = 6 \times 2.127 \times 10^9 \times 4.19 \times 10^{11} \approx 5.35 \times 10^{21}$$
+
+At 50% MFU on an A100 (19.5 TFLOPs/s):
+
+$$\text{Effective throughput} = 0.5 \times 19.5 \times 10^{12} = 9.75 \times 10^{12} \text{ FLOPs/s}$$
+
+$$\text{Time} = \frac{5.35 \times 10^{21}}{9.75 \times 10^{12}} \approx 5.49 \times 10^{8} \text{ s} \approx 6{,}354 \text{ days} \approx 17.4 \text{ years}$$
+
