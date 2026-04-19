@@ -3,3 +3,4 @@ from cs336_basics.training.adamw import AdamW
 from cs336_basics.training.learning_rate_schedule import learning_rate_schedule
 from cs336_basics.training.gradient_clipping import gradient_clipping
 from cs336_basics.training.data_loading import data_loading
+from cs336_basics.training.checkpointing import load_checkpoint, save_checkpoint
